@@ -1,0 +1,174 @@
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    working_dir: /home/dynamodblocal
+    ports:
+      - "8010:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "test \"$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/)\" = 400"
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  station-reservation-service:
+    build:
+      context: .
+      dockerfile: station-reservation-service/Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      TABLE_NAME: connector-locks-local
+      ENVIRONMENT: local
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  saga-auditor-service:
+    profiles: ["observability"]
+    build:
+      context: .
+      dockerfile: saga-auditor-service/Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      SAGA_TABLE_NAME: charging-sagas-local
+      PREFECT_SERVER_EPHEMERAL_STARTUP_TIMEOUT_SECONDS: "120"
+      ENVIRONMENT: local
+      SAGA_STALE_AFTER_SECONDS: "600"
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+      saga-orchestrator-service:
+        condition: service_healthy
+
+  billing-wallet-service:
+    build:
+      context: .
+      dockerfile: billing-wallet-service/Dockerfile
+    environment:
+      DATABASE_PATH: /data/wallet.db
+      ALLOW_TEST_FUNDING: "true"
+      ENVIRONMENT: local
+    volumes:
+      - wallet-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    ports:
+      - "8002:8000"
+
+  energy-dispatch-service:
+    build:
+      context: .
+      dockerfile: energy-dispatch-service/Dockerfile
+    environment:
+      TELEMETRY_INTERVAL_SECONDS: "2"
+      SIMULATE_CHARGER_HARDWARE_FAULT: ${SIMULATE_CHARGER_HARDWARE_FAULT:-false}
+      ENVIRONMENT: local
+    ports:
+      - "8003:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  saga-orchestrator-service:
+    build:
+      context: .
+      dockerfile: saga-orchestrator-service/Dockerfile
+    environment:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      SAGA_TABLE_NAME: charging-sagas-local
+      ENVIRONMENT: local
+      STATION_RESERVATION_URL: http://station-reservation-service:8000
+      BILLING_WALLET_URL: http://billing-wallet-service:8000
+      ENERGY_DISPATCH_URL: http://energy-dispatch-service:8000
+    depends_on:
+      dynamodb-local:
+        condition: service_healthy
+      station-reservation-service:
+        condition: service_healthy
+      billing-wallet-service:
+        condition: service_healthy
+      energy-dispatch-service:
+        condition: service_healthy
+    ports:
+      - "8004:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  graphql-api-gateway:
+    build:
+      context: .
+      dockerfile: graphql-api-gateway/Dockerfile
+    environment:
+      ENVIRONMENT: local
+      STATION_RESERVATION_URL: http://station-reservation-service:8000
+      ENERGY_DISPATCH_URL: http://energy-dispatch-service:8000
+      SAGA_ORCHESTRATOR_URL: http://saga-orchestrator-service:8000
+    depends_on:
+      station-reservation-service:
+        condition: service_healthy
+      energy-dispatch-service:
+        condition: service_healthy
+      saga-orchestrator-service:
+        condition: service_healthy
+    ports:
+      - "8005:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  wallet-data:

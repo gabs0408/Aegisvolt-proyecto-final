@@ -1,0 +1,354 @@
+name: Deploy
+
+on:
+  push:
+    branches: [dev, test, prod]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lint and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff pytest
+          while IFS= read -r requirements; do
+            python -m pip install -r "$requirements"
+          done < <(find Microservicios -mindepth 2 -maxdepth 3 -name requirements.txt ! -path 'Microservicios/saga-auditor-service/requirements.txt' -print | sort)
+
+      - name: Lint and test
+        run: |
+          ruff check Microservicios
+          pytest -q Microservicios/tests
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Select workspace and apply infrastructure
+        id: terraform
+        working-directory: Microservicios/terraform
+        env:
+          DESTINATION_BRANCH: ${{ github.ref_name }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TF_VAR_cluster_endpoint_public_access_cidrs: ${{ vars.EKS_API_ALLOWED_CIDRS }}
+        run: |
+          case "$DESTINATION_BRANCH" in
+            dev|test|prod) workspace="$DESTINATION_BRANCH" ;;
+            *) echo "Unsupported deployment branch: $DESTINATION_BRANCH" >&2; exit 1 ;;
+          esac
+          : "${TF_STATE_BUCKET:?Set the TF_STATE_BUCKET environment variable}"
+          : "${AWS_REGION:?Set the AWS_REGION environment variable}"
+          : "${TF_VAR_cluster_endpoint_public_access_cidrs:?Set EKS_API_ALLOWED_CIDRS to trusted CIDRs in this GitHub Environment}"
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=charging-platform/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+          terraform workspace select "$workspace" || terraform workspace new "$workspace"
+          terraform apply -input=false -auto-approve -var="aws_region=$AWS_REGION"
+          {
+            echo "cluster_name=$(terraform output -raw cluster_name)"
+            echo "ecr_registry=$(terraform output -raw ecr_registry)"
+            echo "ecr_repository_names=$(terraform output -json ecr_repository_names | jq -c)"
+            echo "load_balancer_controller_role_arn=$(terraform output -raw load_balancer_controller_role_arn)"
+            echo "station_reservation_role_arn=$(terraform output -raw station_reservation_role_arn)"
+            echo "saga_orchestrator_role_arn=$(terraform output -raw saga_orchestrator_role_arn)"
+            echo "saga_auditor_role_arn=$(terraform output -raw saga_auditor_role_arn)"
+            echo "vpc_id=$(terraform output -raw vpc_id)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure cluster access
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          CLUSTER_NAME: ${{ steps.terraform.outputs.cluster_name }}
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
+
+      - name: Install AWS Load Balancer Controller
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          CLUSTER_NAME: ${{ steps.terraform.outputs.cluster_name }}
+          VPC_ID: ${{ steps.terraform.outputs.vpc_id }}
+          LBC_ROLE_ARN: ${{ steps.terraform.outputs.load_balancer_controller_role_arn }}
+        run: |
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update eks
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName="$CLUSTER_NAME" \
+            --set region="$AWS_REGION" \
+            --set vpcId="$VPC_ID" \
+            --set serviceAccount.create=true \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$LBC_ROLE_ARN" \
+            --wait --timeout 5m
+
+      - name: Login to Amazon ECR
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ steps.terraform.outputs.ecr_registry }}
+        run: aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build and push service images
+        env:
+          ECR_REGISTRY: ${{ steps.terraform.outputs.ecr_registry }}
+          ECR_REPOSITORIES: ${{ steps.terraform.outputs.ecr_repository_names }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          services=(station-reservation-service billing-wallet-service energy-dispatch-service saga-orchestrator-service saga-auditor-service graphql-api-gateway)
+          for service in "${services[@]}"; do
+            repository="$(jq -r --arg service "$service" '.[$service]' <<< "$ECR_REPOSITORIES")"
+            image="$ECR_REGISTRY/$repository:$IMAGE_TAG"
+            docker build -f "Microservicios/$service/Dockerfile" --tag "$image" Microservicios
+            docker push "$image"
+          done
+
+      - name: Configure chart values
+        id: chart
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          INGRESS_ALLOWED_CIDRS: ${{ vars.INGRESS_ALLOWED_CIDRS }}
+          ECR_REGISTRY: ${{ steps.terraform.outputs.ecr_registry }}
+          ECR_REPOSITORIES: ${{ steps.terraform.outputs.ecr_repository_names }}
+          IMAGE_TAG: ${{ github.sha }}
+          NAMESPACE: charging-${{ github.ref_name }}
+          STATION_ROLE_ARN: ${{ steps.terraform.outputs.station_reservation_role_arn }}
+          SAGA_ORCHESTRATOR_ROLE_ARN: ${{ steps.terraform.outputs.saga_orchestrator_role_arn }}
+          SAGA_AUDITOR_ROLE_ARN: ${{ steps.terraform.outputs.saga_auditor_role_arn }}
+        run: |
+          : "${INGRESS_ALLOWED_CIDRS:?Set INGRESS_ALLOWED_CIDRS to trusted CIDRs in this GitHub Environment}"
+          ingress_allowed_cidrs="$(python - "$INGRESS_ALLOWED_CIDRS" <<'PY'
+          import ipaddress
+          import json
+          import sys
+
+          cidrs = json.loads(sys.argv[1])
+          if not isinstance(cidrs, list) or not cidrs:
+              raise SystemExit("INGRESS_ALLOWED_CIDRS must be a non-empty JSON array")
+
+          networks = [ipaddress.ip_network(cidr, strict=False) for cidr in cidrs]
+          if any(network.prefixlen == 0 for network in networks):
+              raise SystemExit("Unrestricted ingress CIDRs are not allowed")
+
+          print(json.dumps([str(network) for network in networks]))
+          PY
+          )"
+          repository() { jq -r --arg service "$1" '.[$service]' <<< "$ECR_REPOSITORIES"; }
+          if helm status charging --namespace "$NAMESPACE" >/dev/null 2>&1; then
+            stable_tag="$(helm get values charging --namespace "$NAMESPACE" --all --output json | jq -r '.stableTag // empty')"
+          else
+            stable_tag=""
+          fi
+          stable_tag="${stable_tag:-$IMAGE_TAG}"
+          echo "stable_tag=$stable_tag" >> "$GITHUB_OUTPUT"
+          cat > /tmp/charging-values.yaml <<EOF
+          awsRegion: $AWS_REGION
+          imageRegistry: $ECR_REGISTRY
+          stableTag: $stable_tag
+          canaryTag: $IMAGE_TAG
+          stableWeight: 90
+          canaryWeight: 10
+          stationReservationRoleArn: "$STATION_ROLE_ARN"
+          sagaOrchestratorRoleArn: "$SAGA_ORCHESTRATOR_ROLE_ARN"
+          sagaAuditorRoleArn: "$SAGA_AUDITOR_ROLE_ARN"
+          ingress:
+            allowedCidrs: $ingress_allowed_cidrs
+          images:
+            stationReservation: $(repository station-reservation-service)
+            billingWallet: $(repository billing-wallet-service)
+            energyDispatch: $(repository energy-dispatch-service)
+            sagaOrchestrator: $(repository saga-orchestrator-service)
+            graphqlGateway: $(repository graphql-api-gateway)
+          EOF
+          helm upgrade --install charging Microservicios/deploy/helm/charging \
+            --namespace "$NAMESPACE" --create-namespace \
+            --values /tmp/charging-values.yaml \
+            --wait --timeout 10m
+
+      - name: Verify canary health and CloudWatch error rate
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          NAMESPACE: charging-${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/charging-graphql-api-gateway-canary -n "$NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/charging-station-reservation-service-canary -n "$NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/charging-billing-wallet-service-canary -n "$NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/charging-energy-dispatch-service-canary -n "$NAMESPACE" --timeout=5m
+          kubectl rollout status deployment/charging-saga-orchestrator-service-canary -n "$NAMESPACE" --timeout=5m
+          kubectl wait --for=condition=Ready pod -l app.kubernetes.io/component=graphql-gateway,track=canary -n "$NAMESPACE" --timeout=5m
+          ingress_address=""
+          for _ in $(seq 1 60); do
+            ingress_address="$(kubectl get ingress charging-graphql -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            if [[ -n "$ingress_address" ]]; then break; fi
+            sleep 10
+          done
+          if [[ -z "$ingress_address" ]]; then
+            echo "ALB ingress did not receive an address" >&2
+            exit 1
+          fi
+          echo "GraphQL endpoint: http://$ingress_address/" | tee -a "$GITHUB_STEP_SUMMARY"
+          python - "$ingress_address" <<'PY'
+          import sys
+          import subprocess
+
+          ingress_address = sys.argv[1]
+          canary_health_checks = 250
+          for index in range(canary_health_checks):
+              result = subprocess.run(
+                  [
+                      "curl", "--fail", "--silent", "--show-error",
+                      f"http://{ingress_address}/health",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  timeout=10,
+              )
+              if result.returncode:
+                  raise SystemExit(
+                      f"HTTP probe {index + 1}/{canary_health_checks} failed: "
+                      f"{result.stderr.strip()}"
+                  )
+          print(f"Sent {canary_health_checks} HTTP health probes through the 10% canary route.")
+          PY
+          target_name="${NAMESPACE}-canary"
+          target_arn="$(aws elbv2 describe-target-groups --names "$target_name" --query 'TargetGroups[0].TargetGroupArn' --output text)"
+          if [[ -z "$target_arn" || "$target_arn" == "None" ]]; then
+            echo "Canary target group $target_name was not found" >&2
+            exit 1
+          fi
+          target_full_name="${target_arn#*:targetgroup/}"
+          load_balancer_arn="$(aws elbv2 describe-target-groups --target-group-arns "$target_arn" --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)"
+          load_balancer_full_name="${load_balancer_arn#*:loadbalancer/}"
+          if [[ -z "$load_balancer_full_name" || "$load_balancer_full_name" == "None" ]]; then
+            echo "Canary target group is not attached to an ALB" >&2
+            exit 1
+          fi
+          python - "$AWS_REGION" "$target_full_name" "$load_balancer_full_name" <<'PY'
+          import sys
+          import time
+          from datetime import datetime, timedelta, timezone
+
+          import boto3
+
+          region, target_group, load_balancer = sys.argv[1:]
+          cloudwatch = boto3.client("cloudwatch", region_name=region)
+          deadline = time.monotonic() + 300
+          while time.monotonic() < deadline:
+              end = datetime.now(timezone.utc)
+              start = end - timedelta(minutes=5)
+              dimensions = [
+                  {"Name": "LoadBalancer", "Value": load_balancer},
+                  {"Name": "TargetGroup", "Value": target_group},
+              ]
+              metrics = {}
+              for name in ("RequestCount", "HTTPCode_Target_5XX_Count"):
+                  result = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/ApplicationELB",
+                      MetricName=name,
+                      Dimensions=dimensions,
+                      StartTime=start,
+                      EndTime=end,
+                      Period=60,
+                      Statistics=["Sum"],
+                  )
+                  metrics[name] = sum(point["Sum"] for point in result["Datapoints"])
+              requests = metrics["RequestCount"]
+              errors = metrics["HTTPCode_Target_5XX_Count"]
+              rate = 100 * errors / requests if requests else 0
+              print(f"Canary last 5m: requests={requests:.0f}, target_5xx={errors:.0f}, error_rate={rate:.2f}%")
+              if requests >= 20 and rate > 5:
+                  raise SystemExit("Canary error rate exceeded the 5% threshold")
+              if requests >= 20:
+                  break
+              time.sleep(30)
+          else:
+              raise SystemExit("Canary received fewer than 20 requests; error rate could not be evaluated")
+          PY
+
+      - name: Promote canary to 100 percent
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REGISTRY: ${{ steps.terraform.outputs.ecr_registry }}
+          ECR_REPOSITORIES: ${{ steps.terraform.outputs.ecr_repository_names }}
+          IMAGE_TAG: ${{ github.sha }}
+          STABLE_TAG: ${{ steps.chart.outputs.stable_tag }}
+          NAMESPACE: charging-${{ github.ref_name }}
+          STATION_ROLE_ARN: ${{ steps.terraform.outputs.station_reservation_role_arn }}
+        run: |
+          repository() { jq -r --arg service "$1" '.[$service]' <<< "$ECR_REPOSITORIES"; }
+          values() {
+            local stable_weight="$1" canary_weight="$2"
+            cat <<EOF
+          awsRegion: $AWS_REGION
+          imageRegistry: $ECR_REGISTRY
+          stableTag: $STABLE_TAG
+          canaryTag: $IMAGE_TAG
+          stableWeight: $stable_weight
+          canaryWeight: $canary_weight
+          stationReservationRoleArn: "$STATION_ROLE_ARN"
+          images:
+            stationReservation: $(repository station-reservation-service)
+            billingWallet: $(repository billing-wallet-service)
+            energyDispatch: $(repository energy-dispatch-service)
+            sagaOrchestrator: $(repository saga-orchestrator-service)
+            graphqlGateway: $(repository graphql-api-gateway)
+          EOF
+          }
+          values 0 100 > /tmp/charging-values.yaml
+          helm upgrade charging Microservicios/deploy/helm/charging \
+            --namespace "$NAMESPACE" --values /tmp/charging-values.yaml \
+            --wait --timeout 10m
+          STABLE_TAG="$IMAGE_TAG" values 100 0 > /tmp/charging-values.yaml
+          helm upgrade charging Microservicios/deploy/helm/charging \
+            --namespace "$NAMESPACE" --values /tmp/charging-values.yaml \
+            --wait --timeout 10m
+
+      - name: Roll back traffic to stable on failure
+        if: failure()
+        env:
+          NAMESPACE: charging-${{ github.ref_name }}
+        run: |
+          if ! helm status charging --namespace "$NAMESPACE" >/dev/null 2>&1; then
+            echo "No Helm release exists to roll back."
+            exit 0
+          fi
+          helm get values charging --namespace "$NAMESPACE" --all --output json > /tmp/charging-current-values.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("/tmp/charging-current-values.json")
+          values = json.loads(path.read_text())
+          if not values.get("stableTag"):
+              raise SystemExit("No stable image tag is available for rollback")
+          values["stableWeight"] = 100
+          values["canaryWeight"] = 0
+          path.write_text(json.dumps(values))
+          PY
+          helm upgrade charging Microservicios/deploy/helm/charging \
+            --namespace "$NAMESPACE" \
+            --values /tmp/charging-current-values.json \
+            --wait --timeout 10m

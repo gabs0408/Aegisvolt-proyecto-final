@@ -1,0 +1,134 @@
+{{- $root := . -}}
+{{- $workloads := list
+  (dict "name" "station-reservation-service" "component" "station-reservation-service" "image" .Values.images.stationReservation "port" 8000)
+  (dict "name" "billing-wallet-service" "component" "billing-wallet-service" "image" .Values.images.billingWallet "port" 8000)
+  (dict "name" "energy-dispatch-service" "component" "energy-dispatch-service" "image" .Values.images.energyDispatch "port" 8000)
+  (dict "name" "saga-orchestrator-service" "component" "saga-orchestrator-service" "image" .Values.images.sagaOrchestrator "port" 8000)
+  (dict "name" "graphql-api-gateway" "component" "graphql-gateway" "image" .Values.images.graphqlGateway "port" 8000)
+-}}
+{{- range $workload := $workloads }}
+{{- range $track := list "stable" "canary" }}
+{{- $tag := ternary $root.Values.stableTag $root.Values.canaryTag (eq $track "stable") }}
+{{- $replicas := ternary $root.Values.replicas.stable $root.Values.replicas.canary (eq $track "stable") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ printf "charging-%s-%s" $workload.name $track }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: charging
+    app.kubernetes.io/component: {{ $workload.component }}
+    track: {{ $track }}
+spec:
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: {{ $workload.component }}
+      track: {{ $track }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: charging
+        app.kubernetes.io/component: {{ $workload.component }}
+        track: {{ $track }}
+    spec:
+      {{- if eq $workload.component "station-reservation-service" }}
+      serviceAccountName: station-reservation-service
+      {{- else if eq $workload.component "saga-orchestrator-service" }}
+      serviceAccountName: saga-orchestrator-service
+      {{- end }}
+      containers:
+        - name: {{ $workload.name }}
+          image: {{ printf "%s/%s:%s" $root.Values.imageRegistry $workload.image $tag | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ $workload.port }}
+          env:
+            - name: SERVICE_NAME
+              value: {{ $workload.name | quote }}
+            - name: ENVIRONMENT
+              value: {{ trimPrefix "charging-" $root.Release.Namespace | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ $root.Values.awsRegion | quote }}
+            {{- if eq $workload.component "station-reservation-service" }}
+            - name: TABLE_NAME
+              value: {{ printf "charging-%s-connector-locks" $root.Release.Namespace | quote }}
+            {{- end }}
+            {{- if eq $workload.component "billing-wallet-service" }}
+            - name: DATABASE_PATH
+              value: /tmp/wallet.db
+            - name: ALLOW_TEST_FUNDING
+              value: "false"
+            {{- end }}
+            {{- if eq $workload.component "energy-dispatch-service" }}
+            - name: SIMULATE_CHARGER_HARDWARE_FAULT
+              value: "false"
+            {{- end }}
+            {{- if eq $workload.component "saga-orchestrator-service" }}
+            - name: SAGA_TABLE_NAME
+              value: {{ printf "%s-sagas" $root.Release.Namespace | quote }}
+            - name: STATION_RESERVATION_URL
+              value: {{ printf "http://charging-station-reservation-service-%s:8000" (ternary "canary" "stable" (eq $track "canary")) | quote }}
+            - name: BILLING_WALLET_URL
+              value: http://charging-billing-wallet-service-stable:8000
+            - name: ENERGY_DISPATCH_URL
+              value: {{ printf "http://charging-energy-dispatch-service-%s:8000" (ternary "canary" "stable" (eq $track "canary")) | quote }}
+            {{- end }}
+            {{- if eq $workload.component "graphql-gateway" }}
+            - name: STATION_RESERVATION_URL
+              value: {{ printf "http://charging-station-reservation-service-%s:8000" (ternary "canary" "stable" (eq $track "canary")) | quote }}
+            - name: ENERGY_DISPATCH_URL
+              value: {{ printf "http://charging-energy-dispatch-service-%s:8000" (ternary "canary" "stable" (eq $track "canary")) | quote }}
+            - name: SAGA_ORCHESTRATOR_URL
+              value: {{ printf "http://charging-saga-orchestrator-service-%s:8000" (ternary "canary" "stable" (eq $track "canary")) | quote }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "charging-%s-%s" $workload.name $track }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: charging
+    app.kubernetes.io/component: {{ $workload.component }}
+    track: {{ $track }}
+  {{- if eq $workload.component "graphql-gateway" }}
+  annotations:
+    alb.ingress.kubernetes.io/target-group-name: {{ printf "%s-%s" $root.Release.Namespace $track | trunc 32 | trimSuffix "-" | quote }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: {{ $workload.component }}
+    track: {{ $track }}
+  ports:
+    - name: http
+      port: {{ $workload.port }}
+      targetPort: http
+{{- end }}
+{{- end }}

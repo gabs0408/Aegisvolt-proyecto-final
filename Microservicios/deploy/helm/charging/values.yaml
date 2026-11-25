@@ -1,0 +1,24 @@
+namespace: charging-dev
+awsRegion: us-east-1
+imageRegistry: example.dkr.ecr.us-east-1.amazonaws.com
+stableTag: latest
+canaryTag: latest
+stableWeight: 90
+canaryWeight: 10
+stationReservationRoleArn: ""
+sagaOrchestratorRoleArn: ""
+sagaAuditorRoleArn: ""
+replicas:
+  stable: 1
+  canary: 1
+images:
+  stationReservation: station-reservation-service
+  billingWallet: billing-wallet-service
+  energyDispatch: energy-dispatch-service
+  sagaOrchestrator: saga-orchestrator-service
+  sagaAuditor: saga-auditor-service
+  graphqlGateway: graphql-api-gateway
+ingress:
+  hostname: ""
+  certificateArn: ""
+  allowedCidrs: []

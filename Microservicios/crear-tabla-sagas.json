@@ -1,0 +1,42 @@
+﻿{
+    "BillingMode":  "PAY_PER_REQUEST",
+    "GlobalSecondaryIndexes":  [
+                                   {
+                                       "Projection":  {
+                                                          "ProjectionType":  "ALL"
+                                                      },
+                                       "KeySchema":  [
+                                                         {
+                                                             "AttributeName":  "status",
+                                                             "KeyType":  "HASH"
+                                                         },
+                                                         {
+                                                             "AttributeName":  "updated_at",
+                                                             "KeyType":  "RANGE"
+                                                         }
+                                                     ],
+                                       "IndexName":  "status-updated-at-index"
+                                   }
+                               ],
+    "TableName":  "charging-sagas-local",
+    "KeySchema":  [
+                      {
+                          "AttributeName":  "correlation_id",
+                          "KeyType":  "HASH"
+                      }
+                  ],
+    "AttributeDefinitions":  [
+                                 {
+                                     "AttributeName":  "correlation_id",
+                                     "AttributeType":  "S"
+                                 },
+                                 {
+                                     "AttributeName":  "status",
+                                     "AttributeType":  "S"
+                                 },
+                                 {
+                                     "AttributeName":  "updated_at",
+                                     "AttributeType":  "S"
+                                 }
+                             ]
+}

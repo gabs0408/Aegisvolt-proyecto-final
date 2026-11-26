@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, test, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install lint and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff pytest
+          while IFS= read -r requirements; do
+            python -m pip install -r "$requirements"
+          done < <(find Microservicios -mindepth 2 -maxdepth 3 -name requirements.txt ! -path 'Microservicios/saga-auditor-service/requirements.txt' -print | sort)
+
+      - name: Lint Python
+        run: ruff check Microservicios
+
+      - name: Run unit tests
+        run: pytest -q Microservicios/tests
+
+      - name: Build every Docker image
+        run: docker compose --profile observability -p charging-ci -f Microservicios/docker-compose.yml build
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Check Terraform formatting and validate
+        working-directory: Microservicios/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  terraform-plan:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Select destination workspace
+        working-directory: Microservicios/terraform
+        env:
+          DESTINATION_BRANCH: ${{ github.base_ref }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TF_VAR_cluster_endpoint_public_access_cidrs: ${{ vars.EKS_API_ALLOWED_CIDRS }}
+        run: |
+          case "$DESTINATION_BRANCH" in
+            dev|test|prod) workspace="$DESTINATION_BRANCH" ;;
+            *) echo "Unsupported PR destination: $DESTINATION_BRANCH" >&2; exit 1 ;;
+          esac
+          : "${TF_STATE_BUCKET:?Set the TF_STATE_BUCKET environment variable}"
+          : "${AWS_REGION:?Set the AWS_REGION environment variable}"
+          : "${TF_VAR_cluster_endpoint_public_access_cidrs:?Set EKS_API_ALLOWED_CIDRS to trusted CIDRs in this GitHub Environment}"
+          terraform init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=charging-platform/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+          terraform workspace select "$workspace" || terraform workspace new "$workspace"
+          echo "TF_WORKSPACE=$workspace" >> "$GITHUB_ENV"
+
+      - name: Terraform plan
+        working-directory: Microservicios/terraform
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TF_VAR_cluster_endpoint_public_access_cidrs: ${{ vars.EKS_API_ALLOWED_CIDRS }}
+        run: terraform plan -input=false -no-color -var="aws_region=$AWS_REGION"
